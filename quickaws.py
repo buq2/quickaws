@@ -25,12 +25,16 @@ class QuickAws(object):
 		iam_policy_name = 'buq2-ml-bucket-access-policy',
 		iam_instance_profile_name = 'buq2-ml-bucket-access-profile',
 		monitoring = False,
-		jupyterfile = ''
+		jupyterfile = '',
+		do_not_upload = False,
+		shutdown_behavior='terminate',
+		do_not_shutdown = False,
+		terminate_after_seconds = 86400
 		):
 
 		if jupyterfile:
 			if not usercommand:
-				usercommand = 'jupyter nbconvert --to notebook --execute {jupyterfile} --output {jupyterfile}.result.ipynb'.format(jupyterfile=jupyterfile)
+				usercommand = 'jupyter nbconvert --ExecutePreprocessor.timeout={terminate_after_seconds} --to notebook --execute {jupyterfile} --output {jupyterfile}.result.ipynb'.format(jupyterfile=jupyterfile,terminate_after_seconds=terminate_after_seconds)
 
 			result_files.append('{jupyterfile}.result.ipynb'.format(jupyterfile=jupyterfile))
 			files_to_upload.append(jupyterfile)
@@ -55,6 +59,10 @@ class QuickAws(object):
 		self.iam_instance_profile_name = iam_instance_profile_name
 		self.monitoring = monitoring
 		#self.jupyterfile = jupyterfile
+		self.do_not_upload = do_not_upload
+		self.shutdown_behavior = shutdown_behavior
+		self.do_not_shutdown = do_not_shutdown
+		self.terminate_after_seconds = terminate_after_seconds
 
 		self.instance = None
 		
@@ -112,24 +120,32 @@ class QuickAws(object):
 				conda update --yes --all
 				'''
 
+		shutdown_string = 'sudo shutdown -h now'
+		if self.do_not_shutdown:
+			shutdown_string = ''
+
 		user_data = '''#!/bin/bash
 		aws s3 cp s3://{bucket_name}/{tarname} .
 		tar -zxvf {tarname}
 		{anaconda_install_string}
-		export PATH="$HOME/anaconda/bin:$PATH"
+		export PATH="/root/anaconda/bin:$PATH"
 		{anaconda_update_string}
 		{usercommand}
 		tar cfz {result_tarname} {result_files}
 		aws s3 cp {result_tarname} s3://{bucket_name}/{result_tarname}
-		sudo shutdown -h now'''.format(bucket_name=self.bucket_name, 
+		{shutdown_string}'''.format(bucket_name=self.bucket_name, 
 									tarname=self.tarname, 
 									result_tarname=self.result_tarname,
 									result_files=' '.join(self.result_files),
 									usercommand=self.usercommand,
 									anaconda_update_string=anaconda_update_string,
-									anaconda_install_string=anaconda_install_string)
-
+									anaconda_install_string=anaconda_install_string,
+									shutdown_string=shutdown_string)
+		#print(user_data)
+		#import sys
+		#sys.exit()
 		ec2 = boto3.resource('ec2', region_name=self.instance_location)
+
 		instances = ec2.create_instances(
 			ImageId=self.instance_image_id, 
 			MinCount=1, 
@@ -137,7 +153,7 @@ class QuickAws(object):
 			KeyName=self.keyname,
 			InstanceType=self.instancetype,
 			Monitoring={'Enabled':self.monitoring},
-			InstanceInitiatedShutdownBehavior='terminate',
+			InstanceInitiatedShutdownBehavior=self.shutdown_behavior,
 			UserData=user_data
 		)
 		self.instance = instances[0]
@@ -219,17 +235,25 @@ class QuickAws(object):
 			InstanceId=self.instance.id)
 		print('Associated instance profile {0} with ec2 instance {1}'.format(self.iam_instance_profile_name, self.instance.id))
 
+	def _printLog(self, chars_printed):
+		log = self.instance.console_output()
+		if 'Output' in log:
+			logstr = log['Output']
+			print(logstr[chars_printed:-1])
+			chars_printed = len(logstr)
+		return chars_printed
+
 	def _waitUntilTerminated(self):
 		# Wait until instance is terminated
 		chars_printed = 0
 		while self.instance.state['Name'] != 'terminated':
-		    log = self.instance.console_output()
-		    if 'Output' in log:
-		        logstr = log['Output']
-		        print(logstr[chars_printed:-1])
-		        chars_printed = len(logstr)
+		    chars_printed = self._printLog(chars_printed)
 		
 		self.instance.wait_until_terminated()
+
+		# Print rest of the log
+		self._printLog(chars_printed)
+
 		print('Instance terminated')
 
 	def _downloadFromS3(self):
@@ -243,8 +267,9 @@ class QuickAws(object):
 		tar.close()
 
 	def start(self):
-		self._tarFiles()
-		self._uploadToS3()
+		if not self.do_not_upload:
+			self._tarFiles()
+			self._uploadToS3()
 		self._createKeys()
 		self._createInstance()
 		self._createInstancePermissions()
