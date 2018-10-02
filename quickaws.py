@@ -62,7 +62,7 @@ class QuickAws(object):
 		# Tar data
 		
 		tar = tarfile.open(self.tarname, "w:gz")
-		for f in self.files_to_transfer:
+		for f in self.files_to_upload:
 			if os.path.isfile(f) or os.path.isdir(f):
 				tar.add(f)
 			else:
@@ -94,7 +94,7 @@ class QuickAws(object):
 			outfile.write(key_pair_out)
 			outfile.close()
 		else:
-			print('Keyfile {keyfilename} already exist, using existing key'.format(keyfilename=self.keyfilename)
+			print('Keyfile {keyfilename} already exist, using existing key'.format(keyfilename=self.keyfilename))
 
 	def _createInstance(self):
 		# Create actual instance
@@ -129,6 +129,7 @@ class QuickAws(object):
 									anaconda_update_string=anaconda_update_string,
 									anaconda_install_string=anaconda_install_string)
 
+		ec2 = boto3.resource('ec2', region_name=self.instance_location)
 		instances = ec2.create_instances(
 			ImageId=self.instance_image_id, 
 			MinCount=1, 
@@ -161,7 +162,7 @@ class QuickAws(object):
 					{{
 						"Effect": "Allow",
 						"Action": ["s3:ListBucket"],
-						"Resource": ["arn:aws:s3:::{0}"]
+						"Resource": ["arn:aws:s3:::{bucket_name}"]
 					}},
 					{{
 						"Effect": "Allow",
@@ -169,7 +170,7 @@ class QuickAws(object):
 							"s3:PutObject",
 							"s3:GetObject"
 						],
-						"Resource": ["arn:aws:s3:::{1}/*"]
+						"Resource": ["arn:aws:s3:::{bucket_name}/*"]
 					}}
 				]
 			}}'''.format(bucket_name=self.bucket_name)
@@ -209,7 +210,6 @@ class QuickAws(object):
 			print('Added role {0} ro instance profile {1}'.format(self.iam_role_name, self.iam_instance_profile_name))
 			
 			
-		iam_client = boto3.client('iam')
 		ec2_client = boto3.client('ec2', region_name=self.instance_location)
 		ec2_client.associate_iam_instance_profile(
 			IamInstanceProfile={
@@ -232,7 +232,7 @@ class QuickAws(object):
 		self.instance.wait_until_terminated()
 		print('Instance terminated')
 
-	self _downloadFromS3(self):
+	def _downloadFromS3(self):
 		# Download results from aws
 		s3 = boto3.client('s3')
 		s3.download_file(self.bucket_name, self.result_tarname, self.result_tarname)
