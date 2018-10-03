@@ -13,7 +13,7 @@ class QuickAws(object):
 		result_tarname = 'result.tar.gz',
 		bucket_name = 'buq2-ml-bucket',
 		bucket_location = 'eu-central-1',
-		instance_location = 'eu-central-1',
+		instance_location = 'cheapest', #for example 'eu-central-1' or 'cheapest'
 		keyfilename = 'key.pem',
 		install_anaconda = False,
 		installed_anaconda_version = 'Anaconda3-5.2.0-Linux-x86_64',
@@ -29,12 +29,19 @@ class QuickAws(object):
 		do_not_upload = False,
 		shutdown_behavior='terminate',
 		do_not_shutdown = False,
-		terminate_after_seconds = 86400
+		terminate_after_seconds = 86400,
+		console_output_filename = 'console_output.txt'
 		):
+
+		if instance_location == 'cheapest':
+			locinfo = CheapestEc2Region(instancetype)
+			instance_location = locinfo['region'][0]
+			print('Cheapest {type} instance is located at {location} with price {price}USD/h'.format(type=instancetype,location=instance_location,price=locinfo['price']))
 
 		if jupyterfile:
 			if not usercommand:
-				usercommand = 'jupyter nbconvert --ExecutePreprocessor.timeout={terminate_after_seconds} --to notebook --execute {jupyterfile} --output {jupyterfile}.result.ipynb'.format(jupyterfile=jupyterfile,terminate_after_seconds=terminate_after_seconds)
+				result_files.append(console_output_filename)
+				usercommand = 'jupyter nbconvert --ExecutePreprocessor.timeout={terminate_after_seconds} --to notebook --execute {jupyterfile} --output {jupyterfile}.result.ipynb >>{console_output_filename} 2>&1'.format(jupyterfile=jupyterfile,terminate_after_seconds=terminate_after_seconds,console_output_filename=console_output_filename)
 
 			result_files.append('{jupyterfile}.result.ipynb'.format(jupyterfile=jupyterfile))
 			files_to_upload.append(jupyterfile)
@@ -63,7 +70,7 @@ class QuickAws(object):
 		self.shutdown_behavior = shutdown_behavior
 		self.do_not_shutdown = do_not_shutdown
 		self.terminate_after_seconds = terminate_after_seconds
-
+		
 		self.instance = None
 		
 	def _tarFiles(self):
@@ -275,3 +282,86 @@ class QuickAws(object):
 		self._createInstancePermissions()
 		self._waitUntilTerminated()
 		self._downloadFromS3()
+
+def CheapestEc2Region(type='t2.micro'):
+    import os
+    import math
+
+    os.environ['AWSPRICING_USE_CACHE'] = '1'
+    os.environ['AWSPRICING_CACHE_MINUTES'] = '10080' #10080 = 1 week
+
+    import awspricing
+    ec2_offer = awspricing.offer('AmazonEC2')
+    
+    #Cheapest region
+    min_price = math.inf
+    min_region = []
+    
+    #All regions
+    all_regions = []
+    
+    # Search price for every region
+    ec2 = boto3.client('ec2')
+    response = ec2.describe_regions()
+    for reg in response['Regions']:
+        name = reg['RegionName']
+        try:
+            p = ec2_offer.ondemand_hourly(
+                type,
+                operating_system='Linux',
+                region=name
+                )
+
+            all_regions.append({'region':name,'price':p})
+            if p < min_price:
+                min_price = p
+                min_region = [name]
+            elif p == min_price:
+                min_region.append(name)
+        except:
+            pass
+    return {'region':min_region,'price':min_price,'all_regions':all_regions}
+
+def SpotInstancePrice(region,type):
+    client=boto3.client('ec2',region_name='us-east-1')
+    prices=client.describe_spot_price_history(InstanceTypes=[type],MaxResults=1,ProductDescriptions=['Linux/UNIX (Amazon VPC)'],AvailabilityZone=region)
+    return prices['SpotPriceHistory'][0]
+
+def CheapestSpotZone(type='t2.micro'):
+    import math
+
+    #Cheapest region
+    min_price = math.inf
+    min_region = []
+    
+    # All zones
+    all_zones = []
+    
+    # Search price for every region
+    client = boto3.client('ec2',region_name='us-east-1')
+    response = client.describe_regions()
+
+    for reg in response['Regions']:
+        regname = reg['RegionName']
+        client_reg = boto3.client('ec2',region_name=regname)
+        
+        r = client_reg.describe_availability_zones()
+        zones = r['AvailabilityZones']
+        for zone in zones:
+            
+            zonename = zone['ZoneName']
+               
+            try:
+                prices=client_reg.describe_spot_price_history(InstanceTypes=[type],MaxResults=1,ProductDescriptions=['Linux/UNIX (Amazon VPC)'],AvailabilityZone=zonename)
+                
+                p = prices['SpotPriceHistory'][0]['SpotPrice']
+                p = float(p)
+                all_zones.append({'price':p,'zone':zonename})
+                if p < min_price:
+                    min_price = p
+                    min_region = [zonename]
+                elif p == min_price:
+                    min_region.append(zonename)
+            except:
+                pass
+    return {'zone':min_region,'price':min_price,'all_zones':all_zones}
