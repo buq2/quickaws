@@ -3,6 +3,11 @@
 import boto3
 import tarfile
 import os.path
+import time
+import os
+import math
+import base64
+from dateutil import parser
 
 class QuickAws(object):
 	def __init__(self,
@@ -14,13 +19,17 @@ class QuickAws(object):
 		bucket_name = 'buq2-ml-bucket',
 		bucket_location = 'eu-central-1',
 		instance_location = 'cheapest', #for example 'eu-central-1' or 'cheapest'
+		instance_zone = '',
+		use_spot_instance = False,
+		max_hourly_price = None,
 		keyfilename = 'key.pem',
 		install_anaconda = False,
 		installed_anaconda_version = 'Anaconda3-5.2.0-Linux-x86_64',
 		update_anaconda = False,
 		keyname = 'analysis-ec2-instance-key',
 		instancetype = 't2.micro', #'c5.large'#'t2.micro'
-		instance_image_id = 'ami-031723628dc6a197d', # 'ami-0f5dbc86dd9cbf7a8'=base, 'ami-031723628dc6a197d'=anaconda3-buq2
+		instance_image_id = '', # 'ami-0f5dbc86dd9cbf7a8'=base, 'ami-031723628dc6a197d'=anaconda3-buq2
+		image_description = '*ami-031723628dc6a197d*', #*Anaconda3 5.2.0*Amazon*',
 		iam_role_name = 'buq2-ml-bucket-access-role',
 		iam_policy_name = 'buq2-ml-bucket-access-policy',
 		iam_instance_profile_name = 'buq2-ml-bucket-access-profile',
@@ -30,22 +39,116 @@ class QuickAws(object):
 		shutdown_behavior='terminate',
 		do_not_shutdown = False,
 		terminate_after_seconds = 86400,
-		console_output_filename = 'console_output.txt'
+		console_output_filename = 'console_output.txt',
+		tags=['quickaws']
 		):
+		'''QuickAws runs usercommand on ec2 instance as quickly as possible and this way saves money.
+
+		Parameters
+		----------
+		files_to_upload : list
+			List of filenames from local computer which should be uploaded to the instance
+		result_files : list
+			List of filenames which should be fetched from the instance after running the usercommand
+		usercommand : string
+			Usercommand which is run after setting up the instance and loading the files to the instance.
+			If empty and jupyter file is specified, will be automatically generated.
+		tarname : string
+			Name of archive to which files are stored before running the instance
+		result_tarname : string
+			Name of the resulting archive which is uploaded to s3
+		bucket_name : string
+			Name of the s3 bucket to which files will be stored
+		bucket_location : string
+			Location of the s3 bucket
+		instance_location : string
+			Instance location as AWS region string (for example 'eu-central-1'). If 'cheapest', cheapest instance location will be searched
+		instance_zone : string
+			If use_spot_instance is used, full instance location + zone. Can be left empty if instance_location='cheapest'
+		use_spot_instance : bool
+			If true, spot instance will be launched instead of normal instance
+		max_hourly_price : double
+			Maximum hourly price for spot instance. If None, on demand price will be used
+		keyfilename : string
+			Name of the private key file which is used to create access rights to the instance
+		install_anaconda : bool
+			If true, anaconda will be installed
+		installed_anaconda_version : string
+			Anaconda version which should be installed
+		update_anaconda : bool
+			If true, anaconda is automatically updated before running usercommand
+		keyname : string
+			Name of the key created to aws
+		instancetype : string
+			Type of aws ec2 instance to launch. Default 't2.micro'
+		instance_image_id : string
+			Which image is used to create the instance. Can be left empty if image_description is used
+		image_description : string
+			AMI search string
+		iam_role_name : string
+			IAM role name
+		iam_policy_name : string
+			IAM policy name
+		iam_instance_profile_name : string
+			IAM instance profile name
+		monitoring : bool
+			If true, ec2 monitoring will be enabled and additional charges may apply
+		jupyterfile : string
+			Filename of jupyter file. If given jupyter file is automatically run and resulting jupyter file uploaded to s3.
+		do_not_upload : bool
+			If true, files will not be uploaded to s3 before instance launch.
+			Useful when files are already in s3
+		shutdown_behavior : string
+			'terminate' or 'stop'. What happens to instance when it is shut down
+		do_not_shutdown : bool
+			If true, instance will not be shut down automatically
+		terminate_after_seconds : int
+			Maximum run time of the instance in seconds. Default 86400
+		console_output_filename : string
+			Name of console output file. Default 'console_output.txt'
+		tags : list
+			Tag used for created resources. Default ['quickaws']
+		'''
 
 		if instance_location == 'cheapest':
-			locinfo = CheapestEc2Region(instancetype)
-			instance_location = locinfo['region'][0]
-			print('Cheapest {type} instance is located at {location} with price {price}USD/h'.format(type=instancetype,location=instance_location,price=locinfo['price']))
+			# Find cheapest location for the instance type
+			print('Finding cheapest {spot}instance location'.format(spot='spot ' if use_spot_instance else ''))
+			if not use_spot_instance:
+				locinfo = CheapestEc2Region(instancetype)
+				instance_location = locinfo['region'][0]
+			else:
+				locinfo = CheapestSpotZone(instancetype)
+				instance_location = locinfo['region'][0]
+				instance_zone = locinfo['zone'][0]
+
+				resp = CheapestEc2Region(instancetype)
+				ondemand_price = resp['price']
+				ondemand_region = resp['region']
+				if not max_hourly_price:
+					max_hourly_price = ondemand_price 
+				cheapest_on_demand_string = '\nCheapest on demand {price}USD/h at {location}'.format(price=ondemand_price,location=ondemand_region)
+
+			print('Cheapest {type} {spot}instance is located at {location} with price {price}USD/h{comparison}'.format(
+				spot='spot ' if use_spot_instance else '',
+				type=instancetype,
+				location=instance_zone,
+				price=locinfo['price'],
+				comparison=cheapest_on_demand_string if use_spot_instance else ''))
 
 		if jupyterfile:
+			# We are running jupyter file
+
 			if not usercommand:
+				# Usercommand was not given, create it automatically
 				result_files.append(console_output_filename)
 				usercommand = 'jupyter nbconvert --ExecutePreprocessor.timeout={terminate_after_seconds} --to notebook --execute {jupyterfile} --output {jupyterfile}.result.ipynb >>{console_output_filename} 2>&1'.format(jupyterfile=jupyterfile,terminate_after_seconds=terminate_after_seconds,console_output_filename=console_output_filename)
 
-			result_files.append('{jupyterfile}.result.ipynb'.format(jupyterfile=jupyterfile))
+				# Add resulting jupyter file to files to be transferred from the instance
+				result_files.append('{jupyterfile}.result.ipynb'.format(jupyterfile=jupyterfile))
+
+			# Add the jupyter file to files to be uploaded to the instance
 			files_to_upload.append(jupyterfile)
-		
+
 		self.files_to_upload = files_to_upload
 		self.result_files = result_files
 		self.usercommand = usercommand
@@ -70,12 +173,18 @@ class QuickAws(object):
 		self.shutdown_behavior = shutdown_behavior
 		self.do_not_shutdown = do_not_shutdown
 		self.terminate_after_seconds = terminate_after_seconds
-		
+		self.max_hourly_price = max_hourly_price
+		self.use_spot_instance = use_spot_instance
+		self.image_description = image_description
+		self.tags = tags
+
 		self.instance = None
-		
+		self.spot_request_id = None
+		self.instance_zone = instance_zone
+
 	def _tarFiles(self):
 		# Tar data
-		
+
 		tar = tarfile.open(self.tarname, "w:gz")
 		for f in self.files_to_upload:
 			if os.path.isfile(f) or os.path.isdir(f):
@@ -99,7 +208,7 @@ class QuickAws(object):
 
 	def _createKeys(self):
 		# Create aws instance keys
-		ec2 = boto3.resource('ec2', region_name=self.instance_location)
+		ec2 = boto3.client('ec2', region_name=self.instance_location)
 
 		# Create keys for accessing the server, if key not present
 		if not os.path.isfile(self.keyfilename):
@@ -108,28 +217,65 @@ class QuickAws(object):
 			key_pair_out = str(key_pair.key_material)
 			outfile.write(key_pair_out)
 			outfile.close()
+			print('Created key pair {name}. Private key in file {filename}'.format(name=self.keyname,filename=self.keyfilename))
 		else:
 			print('Keyfile {keyfilename} already exist, using existing key'.format(keyfilename=self.keyfilename))
 
-	def _createInstance(self):
-		# Create actual instance
+			# Read private key
+			keyfile = open(self.keyfilename,'r')
+			pem_data = keyfile.read().encode()
+			keyfile.close()
+
+			# Extract public key
+			from cryptography.hazmat.backends import default_backend
+			from cryptography.hazmat.primitives.serialization import load_pem_private_key
+			import cryptography.hazmat.primitives.serialization as serialization
+			key = load_pem_private_key(pem_data, password=None, backend=default_backend())
+			public = key.public_key()
+			public_str = public.public_bytes(encoding=serialization.Encoding.OpenSSH, format=serialization.PublicFormat.OpenSSH)
+
+			try:
+				ec2.import_key_pair(
+					KeyName=self.keyname,
+					PublicKeyMaterial=public_str
+				)
+				print('Imported key pair {name} from file {file}'.format(name=self.keyname, file=self.keyfilename))
+			except ec2.exceptions.ClientError as e:
+				if e.response['Error']['Code'] == 'InvalidKeyPair.Duplicate':
+					# Already exist, all fine
+					print('Key pair with name {name} already exist. Using it'.format(name=self.keyname))
+				else:
+					raise e
+			
+
+	def _anacondaInstallString(self):
 		anaconda_install_string = ''
 		if self.install_anaconda:
 			anaconda_install_string = '''
 				wget https://repo.anaconda.com/archive/{installed_anaconda_version}.sh -O ~/anaconda.sh
 				bash ~/anaconda.sh -b -p $HOME/anaconda
 				'''.format(installed_anaconda_version=self.installed_anaconda_version)
+		return anaconda_install_string
 
+	def _anacondaUpdateString(self):
 		anaconda_update_string = ''
 		if self.update_anaconda:
 			anaconda_update_string = '''
 				conda update --yes -n root conda
 				conda update --yes --all
 				'''
+		return anaconda_update_string
 
+	def _shutdownString(self):
 		shutdown_string = 'sudo shutdown -h now'
 		if self.do_not_shutdown:
 			shutdown_string = ''
+		return shutdown_string
+
+	def _userDataString(self):
+		anaconda_install_string = self._anacondaInstallString()
+		anaconda_update_string = self._anacondaUpdateString()
+		shutdown_string = self._shutdownString()
 
 		user_data = '''#!/bin/bash
 		aws s3 cp s3://{bucket_name}/{tarname} .
@@ -140,35 +286,85 @@ class QuickAws(object):
 		{usercommand}
 		tar cfz {result_tarname} {result_files}
 		aws s3 cp {result_tarname} s3://{bucket_name}/{result_tarname}
-		{shutdown_string}'''.format(bucket_name=self.bucket_name, 
-									tarname=self.tarname, 
+		{shutdown_string}'''.format(bucket_name=self.bucket_name,
+									tarname=self.tarname,
 									result_tarname=self.result_tarname,
 									result_files=' '.join(self.result_files),
 									usercommand=self.usercommand,
 									anaconda_update_string=anaconda_update_string,
 									anaconda_install_string=anaconda_install_string,
 									shutdown_string=shutdown_string)
-		#print(user_data)
-		#import sys
-		#sys.exit()
+		return user_data
+
+	def _createSpotInstance(self):
+		user_data = self._userDataString()
+
+		ec2 = boto3.client('ec2', region_name=self.instance_location)
+		spot_reqs = ec2.request_spot_instances(
+			SpotPrice=str(self.max_hourly_price),
+			LaunchSpecification={
+				'ImageId':self._searchAmi(),
+				'InstanceType':self.instancetype,
+				'Placement':{'AvailabilityZone':self.instance_zone},
+				'KeyName':self.keyname,
+				'UserData':base64.b64encode(user_data.encode("utf-8")).decode("utf-8") ,
+				},
+			InstanceCount=1,
+			)
+
+		self.spot_request_id = spot_reqs['SpotInstanceRequests'][0]['SpotInstanceRequestId']
+
+		print('Created spot request {id}'.format(id=self.spot_request_id))
+
+	def _waitForSpotInstance(self):
+		print('Waiting for spot instance request to be fulfilled', end='')
+		ec2 = boto3.client('ec2', region_name=self.instance_location)
+		spot_wait_sleep = 1
+		
+		while not self.instance:
+			spot_req = ec2.describe_spot_instance_requests(SpotInstanceRequestIds=[self.spot_request_id])['SpotInstanceRequests'][0]
+
+			if spot_req['State'] == 'failed':
+				raise Exception('Spot request failed')
+
+			if not 'InstanceId' in spot_req:
+				print('.',end='')
+				time.sleep(spot_wait_sleep)
+			else:
+				ec2c = boto3.resource('ec2',region_name='us-east-2')
+				self.instance = ec2c.Instance(id=spot_req['InstanceId'])
+
+		print('')
+		self.instance.create_tags(Tags=[{'Key':'quickaws','Value':'1'}])
+		print('Spot instance fulfilled with instance {id}'.format(id=self.instance.id))
+
+	def _createInstance(self):
+		# Create actual instance
+		user_data = self._userDataString()
+
 		ec2 = boto3.resource('ec2', region_name=self.instance_location)
 
 		instances = ec2.create_instances(
-			ImageId=self.instance_image_id, 
-			MinCount=1, 
+			ImageId=self._searchAmi(),
+			MinCount=1,
 			MaxCount=1,
 			KeyName=self.keyname,
 			InstanceType=self.instancetype,
 			Monitoring={'Enabled':self.monitoring},
 			InstanceInitiatedShutdownBehavior=self.shutdown_behavior,
-			UserData=user_data
+			UserData=user_data,
+			TagSpecifications=[{'ResourceType': 'instance','Tags': self.tags},
+								{'ResourceType': 'volume','Tags': self.tags},]
 		)
+			
 		self.instance = instances[0]
 		print("Created instance {0}".format(self.instance.id))
 
 	def _createInstancePermissions(self):
 		# Wait until instance is running
+		print('Waiting for instance to enter ''running'' state')
 		self.instance.wait_until_running()
+		print('Instance entered ''running'' state')
 
 		iam = boto3.resource('iam')
 		instance_profile = iam.InstanceProfile(self.iam_instance_profile_name)
@@ -198,8 +394,10 @@ class QuickAws(object):
 				]
 			}}'''.format(bucket_name=self.bucket_name)
 
-			policy_response = iam.create_policy(PolicyName=self.iam_policy_name,
-							PolicyDocument=policy)
+			policy_response = iam.create_policy(
+							PolicyName=self.iam_policy_name,
+							PolicyDocument=policy,
+							Description='quickaws')
 			print('Created policy {iam_policy_name}'.format(iam_policy_name=self.iam_policy_name))
 
 			role_policy= r'''{
@@ -215,24 +413,25 @@ class QuickAws(object):
 			]
 			}
 			'''
-			
+
 			iam.create_role(RoleName=self.iam_role_name,
-						AssumeRolePolicyDocument=role_policy)
+						AssumeRolePolicyDocument=role_policy,
+						Description='quickaws')
 			print('Created role {0}'.format(self.iam_role_name))
 
 			iam_client = boto3.client('iam')
 			iam_client.attach_role_policy(RoleName=self.iam_role_name,
 								PolicyArn=policy_response.arn)
-			print('Attached policy {0} to role {0}'.format(self.iam_policy_name, self.iam_role_name))
-			
+			print('Attached policy {0} to role {1}'.format(self.iam_policy_name, self.iam_role_name))
+
 			iam_client.create_instance_profile(InstanceProfileName=self.iam_instance_profile_name)
 			print('Created instance profile {0}'.format(self.iam_instance_profile_name))
-			
+
 			iam_client.add_role_to_instance_profile(InstanceProfileName=self.iam_instance_profile_name,
 												RoleName=self.iam_role_name)
 			print('Added role {0} ro instance profile {1}'.format(self.iam_role_name, self.iam_instance_profile_name))
-			
-			
+
+
 		ec2_client = boto3.client('ec2', region_name=self.instance_location)
 		ec2_client.associate_iam_instance_profile(
 			IamInstanceProfile={
@@ -252,10 +451,11 @@ class QuickAws(object):
 
 	def _waitUntilTerminated(self):
 		# Wait until instance is terminated
+		print('Waiting for instance to terminate')
 		chars_printed = 0
 		while self.instance.state['Name'] != 'terminated':
-		    chars_printed = self._printLog(chars_printed)
-		
+			chars_printed = self._printLog(chars_printed)
+
 		self.instance.wait_until_terminated()
 
 		# Print rest of the log
@@ -265,103 +465,132 @@ class QuickAws(object):
 
 	def _downloadFromS3(self):
 		# Download results from aws
+
+		print('Downloading results from S3')
 		s3 = boto3.client('s3')
 		s3.download_file(self.bucket_name, self.result_tarname, self.result_tarname)
-		
+		print('Files downloaded')
+
 		# Extract downloaded data
+		print('Extracting files')
 		tar = tarfile.open(self.result_tarname,'r')
 		tar.extractall()
 		tar.close()
+
+	def _searchAmi(self):
+		if self.instance_image_id:
+			return self.instance_image_id
+		if self.image_description:
+			ec2 = boto3.resource("ec2", region_name=self.instance_location)
+			filters = [ {
+				'Name': 'description',
+				'Values': [self.image_description]
+			}]
+			images = ec2.images.filter(Filters=filters)
+			
+			latest = None
+			for i in images:
+				if not latest:
+					latest = i
+				elif parser.parse(i.creation_date) > parser.parse(latest.creation_date):
+					latest = i
+			print('Found ami {id} with description: {desc}'.format(id=latest.image_id,desc=latest.description))
+			return latest.image_id
 
 	def start(self):
 		if not self.do_not_upload:
 			self._tarFiles()
 			self._uploadToS3()
 		self._createKeys()
-		self._createInstance()
+
+		if self.use_spot_instance:
+			self._createSpotInstance()
+			self._waitForSpotInstance()
+		else:
+			self._createInstance()
 		self._createInstancePermissions()
 		self._waitUntilTerminated()
 		self._downloadFromS3()
+		print('Finished')
 
 def CheapestEc2Region(type='t2.micro'):
-    import os
-    import math
+	#os.environ['AWSPRICING_USE_CACHE'] = '1'
+	#os.environ['AWSPRICING_CACHE_MINUTES'] = '10080' #10080 = 1 week
 
-    os.environ['AWSPRICING_USE_CACHE'] = '1'
-    os.environ['AWSPRICING_CACHE_MINUTES'] = '10080' #10080 = 1 week
+	import awspricing
+	ec2_offer = awspricing.offer('AmazonEC2')
 
-    import awspricing
-    ec2_offer = awspricing.offer('AmazonEC2')
-    
-    #Cheapest region
-    min_price = math.inf
-    min_region = []
-    
-    #All regions
-    all_regions = []
-    
-    # Search price for every region
-    ec2 = boto3.client('ec2')
-    response = ec2.describe_regions()
-    for reg in response['Regions']:
-        name = reg['RegionName']
-        try:
-            p = ec2_offer.ondemand_hourly(
-                type,
-                operating_system='Linux',
-                region=name
-                )
+	#Cheapest region
+	min_price = math.inf
+	min_region = []
 
-            all_regions.append({'region':name,'price':p})
-            if p < min_price:
-                min_price = p
-                min_region = [name]
-            elif p == min_price:
-                min_region.append(name)
-        except:
-            pass
-    return {'region':min_region,'price':min_price,'all_regions':all_regions}
+	#All regions
+	all_regions = []
+
+	# Search price for every region
+	ec2 = boto3.client('ec2')
+	response = ec2.describe_regions()
+	for reg in response['Regions']:
+		name = reg['RegionName']
+		try:
+			p = ec2_offer.ondemand_hourly(
+				type,
+				operating_system='Linux',
+				region=name
+				)
+
+			all_regions.append({'region':name,'price':p})
+			if p < min_price:
+				min_price = p
+				min_region = [name]
+			elif p == min_price:
+				min_region.append(name)
+		except:
+			pass
+	return {'region':min_region,'price':min_price,'all_regions':all_regions}
 
 def SpotInstancePrice(region,type):
-    client=boto3.client('ec2',region_name='us-east-1')
-    prices=client.describe_spot_price_history(InstanceTypes=[type],MaxResults=1,ProductDescriptions=['Linux/UNIX (Amazon VPC)'],AvailabilityZone=region)
-    return prices['SpotPriceHistory'][0]
+	client=boto3.client('ec2',region_name='us-east-1')
+	prices=client.describe_spot_price_history(InstanceTypes=[type],MaxResults=1,ProductDescriptions=['Linux/UNIX (Amazon VPC)'],AvailabilityZone=region)
+	return prices['SpotPriceHistory'][0]
 
 def CheapestSpotZone(type='t2.micro'):
-    import math
+	#Cheapest region
+	min_price = math.inf
+	min_region = []
+	min_zone = []
 
-    #Cheapest region
-    min_price = math.inf
-    min_region = []
-    
-    # All zones
-    all_zones = []
-    
-    # Search price for every region
-    client = boto3.client('ec2',region_name='us-east-1')
-    response = client.describe_regions()
+	# All zones
+	all_zones = []
 
-    for reg in response['Regions']:
-        regname = reg['RegionName']
-        client_reg = boto3.client('ec2',region_name=regname)
-        
-        r = client_reg.describe_availability_zones()
-        zones = r['AvailabilityZones']
-        for zone in zones:
-            
-            zonename = zone['ZoneName']
-               
-            try:
-                prices=client_reg.describe_spot_price_history(InstanceTypes=[type],MaxResults=1,ProductDescriptions=['Linux/UNIX (Amazon VPC)'],AvailabilityZone=zonename)
-                
-                p = prices['SpotPriceHistory'][0]['SpotPrice']
-                p = float(p)
-                all_zones.append({'price':p,'zone':zonename})
-                if p < min_price:
-                    min_price = p
-                    min_region = [zonename]
-                elif p == min_price:
-                    min_region.append(zonename)
-            except:
-                pass
-    return {'zone':min_region,'price':min_price,'all_zones':all_zones}
+	# Search price for every region
+	client = boto3.client('ec2',region_name='us-east-1')
+	response = client.describe_regions()
+
+	for reg in response['Regions']:
+		regname = reg['RegionName']
+		client_reg = boto3.client('ec2',region_name=regname)
+
+		r = client_reg.describe_availability_zones()
+		zones = r['AvailabilityZones']
+		for zone in zones:
+
+			zonename = zone['ZoneName']
+
+			try:
+				prices=client_reg.describe_spot_price_history(InstanceTypes=[type],MaxResults=1,ProductDescriptions=['Linux/UNIX (Amazon VPC)'],AvailabilityZone=zonename)
+
+				p = prices['SpotPriceHistory'][0]['SpotPrice']
+				p = float(p)
+				all_zones.append({'price':p,'zone':zonename,'region':regname})
+				if p < min_price:
+					min_price = p
+					min_zone = [zonename]
+					min_region = [regname]
+				elif p == min_price:
+					min_zone.append(zonename)
+					min_region.append(regname)
+			except:
+				pass
+	return {'zone':min_zone,'price':min_price,'region':min_region,'all_zones':all_zones}
+	
