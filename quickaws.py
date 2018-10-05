@@ -513,8 +513,9 @@ class QuickAws(object):
 	def _estimatePrice(self):
 		time_running = (self.instance_terminate_time - self.instance_start_time).total_seconds()
 		total_time = (self.finish_time - self.start_time).total_seconds()
+		total_price_time = math.max(total_time,60) #Minimum instance billing is for 60 seconds
 		price = self.instance_price_per_hour
-		cost_usd = time_running/60/60*price
+		cost_usd = total_price_time/60/60*price
 		print('Running of instance for {seconds:0.0f}s cost approximately {cost:0.5f}USD'.format(seconds=time_running,cost=cost_usd))
 		print('Total run time including setup {seconds:0.0f}'.format(seconds=total_time))
 
