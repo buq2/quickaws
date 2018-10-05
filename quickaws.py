@@ -8,6 +8,8 @@ import os
 import math
 import base64
 from dateutil import parser
+import datetime
+import pytz
 
 class QuickAws(object):
 	def __init__(self,
@@ -110,16 +112,19 @@ class QuickAws(object):
 			Tag used for created resources. Default ['quickaws']
 		'''
 
+		self.instance_price_per_hour = 0
 		if instance_location == 'cheapest':
 			# Find cheapest location for the instance type
 			print('Finding cheapest {spot}instance location'.format(spot='spot ' if use_spot_instance else ''))
 			if not use_spot_instance:
 				locinfo = CheapestEc2Region(instancetype)
+				self.instance_price_per_hour = locinfo['price']
 				instance_location = locinfo['region'][0]
 			else:
 				locinfo = CheapestSpotZone(instancetype)
 				instance_location = locinfo['region'][0]
 				instance_zone = locinfo['zone'][0]
+				self.instance_price_per_hour = locinfo['price']
 
 				resp = CheapestEc2Region(instancetype)
 				ondemand_price = resp['price']
@@ -177,10 +182,14 @@ class QuickAws(object):
 		self.use_spot_instance = use_spot_instance
 		self.image_description = image_description
 		self.tags = tags
+		self.instance_zone = instance_zone
 
 		self.instance = None
 		self.spot_request_id = None
-		self.instance_zone = instance_zone
+		self.instance_terminate_time = None
+		self.instance_start_time = None
+		self.start_time = None #time when start was called
+		self.finish_time = None #time when call to start ended
 
 	def _tarFiles(self):
 		# Tar data
@@ -457,6 +466,7 @@ class QuickAws(object):
 			chars_printed = self._printLog(chars_printed)
 
 		self.instance.wait_until_terminated()
+		self.instance_terminate_time = datetime.datetime.now(pytz.utc)
 
 		# Print rest of the log
 		self._printLog(chars_printed)
@@ -497,7 +507,21 @@ class QuickAws(object):
 			print('Found ami {id} with description: {desc}'.format(id=latest.image_id,desc=latest.description))
 			return latest.image_id
 
+	def _recordInstanceStartTime(self):
+		self.instance_start_time = self.instance.launch_time
+
+	def _estimatePrice(self):
+		time_running = (self.instance_terminate_time - self.instance_start_time).total_seconds()
+		total_time = (self.finish_time - self.start_time).total_seconds()
+		price = self.instance_price_per_hour
+		cost_usd = time_running/60/60*price
+		print('Running of instance for {seconds:0.0f}s cost approximately {cost:0.5f}USD'.format(seconds=time_running,cost=cost_usd))
+		print('Total run time including setup {seconds:0.0f}'.format(seconds=total_time))
+
+
 	def start(self):
+		self.start_time = datetime.datetime.now(pytz.utc)
+
 		if not self.do_not_upload:
 			self._tarFiles()
 			self._uploadToS3()
@@ -509,8 +533,11 @@ class QuickAws(object):
 		else:
 			self._createInstance()
 		self._createInstancePermissions()
+		self._recordInstanceStartTime()
 		self._waitUntilTerminated()
 		self._downloadFromS3()
+		self.finish_time = datetime.datetime.now(pytz.utc)
+		self._estimatePrice()
 		print('Finished')
 
 def CheapestEc2Region(type='t2.micro'):
