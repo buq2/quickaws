@@ -287,6 +287,7 @@ class QuickAws(object):
 		shutdown_string = self._shutdownString()
 
 		user_data = '''#!/bin/bash
+		sleep {terminate_after_seconds} && sudo shutdown -h now &
 		aws s3 cp s3://{bucket_name}/{tarname} .
 		tar -zxvf {tarname}
 		{anaconda_install_string}
@@ -302,7 +303,8 @@ class QuickAws(object):
 									usercommand=self.usercommand,
 									anaconda_update_string=anaconda_update_string,
 									anaconda_install_string=anaconda_install_string,
-									shutdown_string=shutdown_string)
+									shutdown_string=shutdown_string,
+									terminate_after_seconds=self.terminate_after_seconds)
 		return user_data
 
 	def _createSpotInstance(self):
@@ -451,10 +453,20 @@ class QuickAws(object):
 		print('Associated instance profile {0} with ec2 instance {1}'.format(self.iam_instance_profile_name, self.instance.id))
 
 	def _printLog(self, chars_printed):
-		log = self.instance.console_output()
+		ec2 = boto3.client('ec2')
+		try:
+			log = self.instance.console_output()
+		except ec2.exceptions.ClientError as e:
+			if e.response['Error']['Code'] == 'EndpointConnectionError':
+				print('Connection error to AWS API')
+				return chars_printed
+			else:
+				raise e
 		if 'Output' in log:
 			logstr = log['Output']
-			print(logstr[chars_printed:-1])
+			newstr = logstr[chars_printed:-1]
+			if len(newstr):
+				print(newstr)
 			chars_printed = len(logstr)
 		return chars_printed
 
@@ -536,8 +548,8 @@ class QuickAws(object):
 		self._createInstancePermissions()
 		self._recordInstanceStartTime()
 		self._waitUntilTerminated()
-		self._downloadFromS3()
 		self.finish_time = datetime.datetime.now(pytz.utc)
+		self._downloadFromS3()
 		self._estimatePrice()
 		print('Finished')
 
