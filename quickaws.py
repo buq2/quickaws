@@ -199,7 +199,7 @@ class QuickAws(object):
 			if os.path.isfile(f) or os.path.isdir(f):
 				tar.add(f)
 			else:
-				print('file not found for tarring: %s' % f)
+				raise FileNotFoundError('File not found for tarring',f)
 		tar.close()
 
 	def _uploadToS3(self):
