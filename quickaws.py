@@ -10,48 +10,65 @@ import base64
 from dateutil import parser
 import datetime
 import pytz
+import uuid
 
 class QuickAws(object):
 	def __init__(self,
+	    jupyterfile = '',
+		instancetype = 't2.micro', #'c5.large'#'t2.micro'
 		files_to_upload = [],
 		result_files = [],
+		use_spot_instance = True,
+		instance_location = 'cheapest', #for example 'eu-central-1' or 'cheapest'
 		usercommand = '',
 		tarname = 'data.tar.gz',
 		result_tarname = 'result.tar.gz',
-		bucket_name = 'buq2-ml-bucket',
-		bucket_location = 'eu-central-1',
-		instance_location = 'cheapest', #for example 'eu-central-1' or 'cheapest'
+		bucket_name = '',
+		delete_bucket = None,
+		bucket_location = '',
 		instance_zone = '',
-		use_spot_instance = False,
 		max_hourly_price = None,
 		keyfilename = 'key.pem',
 		install_anaconda = False,
 		installed_anaconda_version = 'Anaconda3-5.2.0-Linux-x86_64',
 		update_anaconda = False,
-		keyname = 'analysis-ec2-instance-key',
-		instancetype = 't2.micro', #'c5.large'#'t2.micro'
+		keyname = '',
+		delete_key = None,
 		instance_image_id = '', # 'ami-0f5dbc86dd9cbf7a8'=base, 'ami-031723628dc6a197d'=anaconda3-buq2
-		image_description = '*ami-031723628dc6a197d*', #*Anaconda3 5.2.0*Amazon*',
-		iam_role_name = 'buq2-ml-bucket-access-role',
-		iam_policy_name = 'buq2-ml-bucket-access-policy',
-		iam_instance_profile_name = 'buq2-ml-bucket-access-profile',
+		image_description = '*Anaconda3 5.2.0*Amazon*',
+		image_name = '*',
+		iam_role_name = '',
+		delete_iam_role = None,
+		iam_policy_name = '',
+		delete_iam_policy = None,
+		iam_instance_profile_name = '',
+		delete_iam_instance_profile = None,
 		monitoring = False,
-		jupyterfile = '',
 		do_not_upload = False,
 		shutdown_behavior='terminate',
 		do_not_shutdown = False,
 		terminate_after_seconds = 86400,
 		console_output_filename = 'console_output.txt',
-		tags=['quickaws']
+		tags=['quickaws'],
+		unsafe_bucket_delete = False,
+		perform_cleanup=True,
 		):
 		'''QuickAws runs usercommand on ec2 instance as quickly as possible and this way saves money.
 
 		Parameters
 		----------
+		jupyterfile : string
+			Filename of jupyter file. If given jupyter file is automatically run and resulting jupyter file uploaded to s3.
+		instancetype : string
+			Type of aws ec2 instance to launch. Default 't2.micro'
 		files_to_upload : list
 			List of filenames from local computer which should be uploaded to the instance
 		result_files : list
 			List of filenames which should be fetched from the instance after running the usercommand
+		use_spot_instance : bool
+			If true, spot instance will be launched instead of normal instance
+		instance_location : string
+			Instance location as AWS region string (for example 'eu-central-1'). If 'cheapest', cheapest instance location will be searched
 		usercommand : string
 			Usercommand which is run after setting up the instance and loading the files to the instance.
 			If empty and jupyter file is specified, will be automatically generated.
@@ -60,15 +77,13 @@ class QuickAws(object):
 		result_tarname : string
 			Name of the resulting archive which is uploaded to s3
 		bucket_name : string
-			Name of the s3 bucket to which files will be stored
+			Name of the s3 bucket to which files will be stored. If empty, unique bucket name will be generated
+		delete_bucket : bool or None
+			If True, bucket will be deleted after successfull run. If None and bucket was created, bucket will be deleted
 		bucket_location : string
-			Location of the s3 bucket
-		instance_location : string
-			Instance location as AWS region string (for example 'eu-central-1'). If 'cheapest', cheapest instance location will be searched
+			Location of the s3 bucket (for example 'eu-central-1')
 		instance_zone : string
 			If use_spot_instance is used, full instance location + zone. Can be left empty if instance_location='cheapest'
-		use_spot_instance : bool
-			If true, spot instance will be launched instead of normal instance
 		max_hourly_price : double
 			Maximum hourly price for spot instance. If None, on demand price will be used
 		keyfilename : string
@@ -81,22 +96,26 @@ class QuickAws(object):
 			If true, anaconda is automatically updated before running usercommand
 		keyname : string
 			Name of the key created to aws
-		instancetype : string
-			Type of aws ec2 instance to launch. Default 't2.micro'
+		delete_key : bool or None
+			If true, aws key will be deleted automatically from aws. If None, only automatically generated key fill be deleted
 		instance_image_id : string
 			Which image is used to create the instance. Can be left empty if image_description is used
 		image_description : string
+			AMI search string. If instance_image_id is not given, this search string is used to find suitable ami
+		image_name : string
 			AMI search string
 		iam_role_name : string
-			IAM role name
+			IAM role name. If empty, will be automatically created
+		delete_iam_role : bool or None
+			If None and new iam role is created the role will also be deleted
 		iam_policy_name : string
 			IAM policy name
+		delete_iam_policy : bool
 		iam_instance_profile_name : string
 			IAM instance profile name
+		delete_iam_instance_profile : bool
 		monitoring : bool
-			If true, ec2 monitoring will be enabled and additional charges may apply
-		jupyterfile : string
-			Filename of jupyter file. If given jupyter file is automatically run and resulting jupyter file uploaded to s3.
+			If true, advanced ec2 monitoring will be enabled and additional charges may apply
 		do_not_upload : bool
 			If true, files will not be uploaded to s3 before instance launch.
 			Useful when files are already in s3
@@ -109,13 +128,17 @@ class QuickAws(object):
 		console_output_filename : string
 			Name of console output file. Default 'console_output.txt'
 		tags : list
-			Tag used for created resources. Default ['quickaws']
+			Tag used for created resources. Default ['quickaws']. First tag will be used for auto generated buckets, keys, etc
+		unsafe_bucket_delete : bool
+			If true, all objects in bucket will be deleted, not just object which were created for this run
+		perform_cleanup : bool
+			If false, keys, buckets, policys etc will not be deleted
 		'''
 
 		self.instance_price_per_hour = 0
 		if instance_location == 'cheapest':
 			# Find cheapest location for the instance type
-			print('Finding cheapest {spot}instance location'.format(spot='spot ' if use_spot_instance else ''))
+			print('Finding cheapest {spot}instance location. This can take several minutes.'.format(spot='spot ' if use_spot_instance else ''))
 			if not use_spot_instance:
 				locinfo = CheapestEc2Region(instancetype)
 				self.instance_price_per_hour = locinfo['price']
@@ -140,13 +163,28 @@ class QuickAws(object):
 				price=locinfo['price'],
 				comparison=cheapest_on_demand_string if use_spot_instance else ''))
 
+		if use_spot_instance and not instance_zone:
+			# Instance zone was not given. Search cheapest one
+			locinfo = CheapestSpotZone(instancetype,regions_to_check=[instance_location])
+			instance_zone = locinfo['zone'][0]
+			self.instance_price_per_hour = locinfo['price']
+
+			if not max_hourly_price:
+				max_hourly_price = locinfo['price']*3
+				print('Setting spot instance max price to 3x the current price: {usd}'.format(usd=max_hourly_price))
+
 		if jupyterfile:
 			# We are running jupyter file
 
 			if not usercommand:
 				# Usercommand was not given, create it automatically
 				result_files.append(console_output_filename)
-				usercommand = 'jupyter nbconvert --ExecutePreprocessor.timeout={terminate_after_seconds} --to notebook --execute {jupyterfile} --output {jupyterfile}.result.ipynb >>{console_output_filename} 2>&1'.format(jupyterfile=jupyterfile,terminate_after_seconds=terminate_after_seconds,console_output_filename=console_output_filename)
+				usercommand = '''
+				jupyter nbconvert --ExecutePreprocessor.timeout={terminate_after_seconds} --to notebook --execute {jupyterfile} --output {jupyterfile}.result.ipynb >>{console_output_filename} 2>&1
+				'''.format(
+					jupyterfile=jupyterfile,
+					terminate_after_seconds=terminate_after_seconds,
+					console_output_filename=console_output_filename)
 
 				# Add resulting jupyter file to files to be transferred from the instance
 				result_files.append('{jupyterfile}.result.ipynb'.format(jupyterfile=jupyterfile))
@@ -181,15 +219,55 @@ class QuickAws(object):
 		self.max_hourly_price = max_hourly_price
 		self.use_spot_instance = use_spot_instance
 		self.image_description = image_description
+		self.image_name = image_name
 		self.tags = tags
 		self.instance_zone = instance_zone
+		self.delete_bucket = delete_bucket
+		self.delete_key = delete_key
+		self.delete_iam_role = delete_iam_role
+		self.delete_iam_policy = delete_iam_policy
+		self.delete_iam_instance_profile = delete_iam_instance_profile
+		self.unsafe_bucket_delete = unsafe_bucket_delete
+		self.perform_cleanup = perform_cleanup
+		self.console_output_filename = console_output_filename
 
 		self.instance = None
+		self.iam_policy = None
 		self.spot_request_id = None
 		self.instance_terminate_time = None
 		self.instance_start_time = None
 		self.start_time = None #time when start was called
 		self.finish_time = None #time when call to start ended
+
+		if not self.bucket_location:
+			# If no bucket location is given, use same location as instance
+			self.bucket_location = self.instance_location
+
+		if not self.bucket_name:
+			self.bucket_name = self._generateUuidName()
+
+		if not self.keyname:
+			self.keyname = self._generateUuidName()
+		
+		if not self.iam_role_name:
+			self.iam_role_name = self._generateUuidName()
+
+		if not self.iam_policy_name:
+			self.iam_policy_name = self._generateUuidName()
+		
+		if not self.iam_instance_profile_name:
+			self.iam_instance_profile_name = self._generateUuidName()
+
+	def _generateUuidName(self):
+		return self._getMainTag() + uuid.uuid4().hex
+
+	def _getMainTag(self):
+		if isinstance(self.tags, str):
+			return self.tags
+		elif not self.tags:
+			return "quickaws-"
+		else:
+			return self.tags[0]
 
 	def _tarFiles(self):
 		# Tar data
@@ -205,12 +283,18 @@ class QuickAws(object):
 	def _uploadToS3(self):
 		# Upload data to aws
 
-		s3 = boto3.client('s3')
+		s3 = boto3.client('s3',region_name=self.bucket_location)
 		try:
 			s3.create_bucket(Bucket=self.bucket_name,
 								CreateBucketConfiguration={'LocationConstraint': self.bucket_location})
-		except:
+			print('Created bucket {bucket}'.format(bucket=self.bucket_name))
+
+			if self.delete_bucket is None:
+				# We created new bucket, it should be automatically deleted
+				self.delete_bucket = True
+		except Exception as e:
 			#Bucket probably already exists
+			print(e)
 			pass
 
 		s3.upload_file(self.tarname, self.bucket_name, self.tarname)
@@ -223,7 +307,7 @@ class QuickAws(object):
 		if not os.path.isfile(self.keyfilename):
 			outfile = open(self.keyfilename,'w')
 			key_pair = ec2.create_key_pair(KeyName=self.keyname)
-			key_pair_out = str(key_pair.key_material)
+			key_pair_out = str(key_pair['KeyMaterial'])
 			outfile.write(key_pair_out)
 			outfile.close()
 			print('Created key pair {name}. Private key in file {filename}'.format(name=self.keyname,filename=self.keyfilename))
@@ -249,6 +333,10 @@ class QuickAws(object):
 					PublicKeyMaterial=public_str
 				)
 				print('Imported key pair {name} from file {file}'.format(name=self.keyname, file=self.keyfilename))
+
+				if self.delete_key is None:
+					# Delete automatically created key
+					self.delete_key = True
 			except ec2.exceptions.ClientError as e:
 				if e.response['Error']['Code'] == 'InvalidKeyPair.Duplicate':
 					# Already exist, all fine
@@ -261,18 +349,18 @@ class QuickAws(object):
 		anaconda_install_string = ''
 		if self.install_anaconda:
 			anaconda_install_string = '''
-				wget https://repo.anaconda.com/archive/{installed_anaconda_version}.sh -O ~/anaconda.sh
-				bash ~/anaconda.sh -b -p $HOME/anaconda
-				'''.format(installed_anaconda_version=self.installed_anaconda_version)
+				wget https://repo.anaconda.com/archive/{installed_anaconda_version}.sh -O ~/anaconda.sh  >> {cfname} 2>&1
+				bash ~/anaconda.sh -b -p $HOME/anaconda >> {cfname} 2>&1
+				'''.format(installed_anaconda_version=self.installed_anaconda_version,cfname=self.console_output_filename)
 		return anaconda_install_string
 
 	def _anacondaUpdateString(self):
 		anaconda_update_string = ''
 		if self.update_anaconda:
 			anaconda_update_string = '''
-				conda update --yes -n root conda
-				conda update --yes --all
-				'''
+				conda update --yes -n root conda >> {cfname} 2>&1
+				conda update --yes --all >> {cfname} 2>&1
+				'''.format(cfname=self.console_output_filename)
 		return anaconda_update_string
 
 	def _shutdownString(self):
@@ -287,11 +375,14 @@ class QuickAws(object):
 		shutdown_string = self._shutdownString()
 
 		user_data = '''#!/bin/bash
+		cd /root # set working directory
 		sleep {terminate_after_seconds} && sudo shutdown -h now &
-		aws s3 cp s3://{bucket_name}/{tarname} .
-		tar -zxvf {tarname}
+		pip install --upgrade botocore awscli >> {cfname} 2>&1 # some AMI versions have broken awscli which this will  fix
+		aws s3 cp s3://{bucket_name}/{tarname} .  >> {cfname} 2>&1
+		tar -zxvf {tarname}  >> {cfname} 2>&1
 		{anaconda_install_string}
-		export PATH="/root/anaconda/bin:$PATH"
+		export PATH="/root/anaconda/bin:$PATH" #required for custom ami/installation
+		export PATH="/opt/conda/bin:$PATH" #required for normal anaconda image
 		{anaconda_update_string}
 		{usercommand}
 		tar cfz {result_tarname} {result_files}
@@ -304,7 +395,8 @@ class QuickAws(object):
 									anaconda_update_string=anaconda_update_string,
 									anaconda_install_string=anaconda_install_string,
 									shutdown_string=shutdown_string,
-									terminate_after_seconds=self.terminate_after_seconds)
+									terminate_after_seconds=self.terminate_after_seconds,
+									cfname=self.console_output_filename)
 		return user_data
 
 	def _createSpotInstance(self):
@@ -372,11 +464,6 @@ class QuickAws(object):
 		print("Created instance {0}".format(self.instance.id))
 
 	def _createInstancePermissions(self):
-		# Wait until instance is running
-		print('Waiting for instance to enter ''running'' state')
-		self.instance.wait_until_running()
-		print('Instance entered ''running'' state')
-
 		iam = boto3.resource('iam')
 		instance_profile = iam.InstanceProfile(self.iam_instance_profile_name)
 		try:
@@ -405,11 +492,13 @@ class QuickAws(object):
 				]
 			}}'''.format(bucket_name=self.bucket_name)
 
-			policy_response = iam.create_policy(
+			self.iam_policy = iam.create_policy(
 							PolicyName=self.iam_policy_name,
 							PolicyDocument=policy,
 							Description='quickaws')
 			print('Created policy {iam_policy_name}'.format(iam_policy_name=self.iam_policy_name))
+			if self.delete_iam_policy is None:
+				self.delete_iam_policy = True
 
 			role_policy= r'''{
 			"Version": "2012-10-17",
@@ -430,9 +519,12 @@ class QuickAws(object):
 						Description='quickaws')
 			print('Created role {0}'.format(self.iam_role_name))
 
+			if self.delete_iam_role is None:
+				self.delete_iam_role = True
+
 			iam_client = boto3.client('iam')
 			iam_client.attach_role_policy(RoleName=self.iam_role_name,
-								PolicyArn=policy_response.arn)
+								PolicyArn=self.iam_policy.arn)
 			print('Attached policy {0} to role {1}'.format(self.iam_policy_name, self.iam_role_name))
 
 			iam_client.create_instance_profile(InstanceProfileName=self.iam_instance_profile_name)
@@ -442,7 +534,19 @@ class QuickAws(object):
 												RoleName=self.iam_role_name)
 			print('Added role {0} ro instance profile {1}'.format(self.iam_role_name, self.iam_instance_profile_name))
 
+			if self.delete_iam_instance_profile is None:
+				self.delete_iam_instance_profile = True
+		
 
+	def _associateInstanceProfile(self):
+		# Wait until instance is running
+		print('Waiting for instance to enter ''running'' state')
+		self.instance.wait_until_running()
+		print('Instance entered ''running'' state')
+
+		iam = boto3.resource('iam')
+		instance_profile = iam.InstanceProfile(self.iam_instance_profile_name)
+		
 		ec2_client = boto3.client('ec2', region_name=self.instance_location)
 		ec2_client.associate_iam_instance_profile(
 			IamInstanceProfile={
@@ -490,8 +594,15 @@ class QuickAws(object):
 
 		print('Downloading results from S3')
 		s3 = boto3.client('s3')
-		s3.download_file(self.bucket_name, self.result_tarname, self.result_tarname)
-		print('Files downloaded')
+		try:
+			s3.download_file(self.bucket_name, self.result_tarname, self.result_tarname)
+			print('Files downloaded')
+		except s3.exceptions.ClientError as e:
+			if e.response['Error']['Code'] == '404':
+				print('No files were uploaded back to s3.')
+				return
+			else:
+				raise e
 
 		# Extract downloaded data
 		print('Extracting files')
@@ -502,12 +613,17 @@ class QuickAws(object):
 	def _searchAmi(self):
 		if self.instance_image_id:
 			return self.instance_image_id
-		if self.image_description:
+		if self.image_description or self.image_name:
 			ec2 = boto3.resource("ec2", region_name=self.instance_location)
 			filters = [ {
 				'Name': 'description',
 				'Values': [self.image_description]
-			}]
+			},
+			{
+				'Name': 'name',
+				'Values': [self.image_name]
+			},
+			]
 			images = ec2.images.filter(Filters=filters)
 			
 			latest = None
@@ -531,6 +647,68 @@ class QuickAws(object):
 		print('Running of instance for {seconds:0.0f}s cost approximately {cost:0.5f}USD'.format(seconds=time_running,cost=cost_usd))
 		print('Total run time including setup {seconds:0.0f}'.format(seconds=total_time))
 
+	def _removeRoleFromInstanceProfile(self):
+		print('Removing role {role} from instance profile {profile}'.format(role=self.iam_role_name, profile=self.iam_instance_profile_name))
+		iam_client = boto3.client('iam')
+		iam_client.remove_role_from_instance_profile(
+			InstanceProfileName=self.iam_instance_profile_name,
+			RoleName=self.iam_role_name
+			)
+
+	def _cleanup(self):
+		iam_client = boto3.client('iam')
+		role_removed = False
+		if self.delete_iam_instance_profile:
+			self._removeRoleFromInstanceProfile()
+			role_removed = True
+
+			print('Deleting iam instance profile {profile}'.format(profile=self.iam_instance_profile_name))
+
+			iam_client.delete_instance_profile(InstanceProfileName=self.iam_instance_profile_name)
+		if self.delete_iam_policy:
+			print('Detaching role {role} from iam policy {policy}'.format(role=self.iam_role_name,policy=self.iam_policy_name))
+
+			iam_client.detach_role_policy(
+				RoleName=self.iam_role_name,
+				PolicyArn=self.iam_policy.arn
+			)
+
+			print('Deleting iam policy {policy}'.format(policy=self.iam_policy_name))
+
+			iam_client.delete_policy(
+				PolicyArn=self.iam_policy.arn
+				)
+		if self.delete_iam_role:
+			if not role_removed:
+				self._removeRoleFromInstanceProfile()
+
+			print('Deleting iam role {role}'.format(role=self.iam_role_name))
+
+			iam_client.delete_role(RoleName=self.iam_role_name)
+		if self.delete_bucket:
+			# Bucket can be deleted only if it is empty
+			s3_resource = boto3.resource('s3')
+			if self.unsafe_bucket_delete:
+				print('Deleting all objects from bucket {bucket}'.format(bucket=self.bucket_name))
+				bucket = s3_resource.Bucket(self.bucket_name)
+				bucket.objects.all().delete()
+			else:
+				print('Deleting objects {f1} and {f2} from bucket {bucket}'.format(f1=self.tarname,f2=self.result_tarname,bucket=self.bucket_name))
+				s3_resource.Object(self.bucket_name, self.tarname).delete()
+				s3_resource.Object(self.bucket_name, self.result_tarname).delete()
+
+			print('Deleting bucket {bucket}'.format(bucket=self.bucket_name))
+			s3_client = boto3.client('s3')
+			s3_client.delete_bucket(Bucket=self.bucket_name)
+		if self.delete_key:
+			print('Deleting key {key}'.format(key=self.keyname))
+			
+			ec2_client = boto3.client('ec2', region_name=self.instance_location)
+			ec2_client.delete_key_pair(KeyName=self.keyname)
+		
+	def _logPublicIp(self):
+		print('Instance public ip: {ip}'.format(ip=self.instance.public_ip_address))
+		
 
 	def start(self):
 		self.start_time = datetime.datetime.now(pytz.utc)
@@ -540,17 +718,21 @@ class QuickAws(object):
 			self._uploadToS3()
 		self._createKeys()
 
+		self._createInstancePermissions()
 		if self.use_spot_instance:
 			self._createSpotInstance()
 			self._waitForSpotInstance()
 		else:
 			self._createInstance()
-		self._createInstancePermissions()
 		self._recordInstanceStartTime()
+		self._associateInstanceProfile()
+		self._logPublicIp()
 		self._waitUntilTerminated()
 		self.finish_time = datetime.datetime.now(pytz.utc)
 		self._downloadFromS3()
 		self._estimatePrice()
+		if self.perform_cleanup:
+			self._cleanup()
 		print('Finished')
 
 def CheapestEc2Region(type='t2.micro'):
@@ -594,7 +776,7 @@ def SpotInstancePrice(region,type):
 	prices=client.describe_spot_price_history(InstanceTypes=[type],MaxResults=1,ProductDescriptions=['Linux/UNIX (Amazon VPC)'],AvailabilityZone=region)
 	return prices['SpotPriceHistory'][0]
 
-def CheapestSpotZone(type='t2.micro'):
+def CheapestSpotZone(type='t2.micro',regions_to_check=[]):
 	#Cheapest region
 	min_price = math.inf
 	min_region = []
@@ -603,12 +785,14 @@ def CheapestSpotZone(type='t2.micro'):
 	# All zones
 	all_zones = []
 
-	# Search price for every region
-	client = boto3.client('ec2',region_name='us-east-1')
-	response = client.describe_regions()
+	if not regions_to_check:
+		# Search price for every region
+		client = boto3.client('ec2',region_name='us-east-1')
+		response = client.describe_regions()
+		for reg in response['Regions']:
+			regions_to_check.append(reg['RegionName'])
+	for regname in regions_to_check:
 
-	for reg in response['Regions']:
-		regname = reg['RegionName']
 		client_reg = boto3.client('ec2',region_name=regname)
 
 		r = client_reg.describe_availability_zones()
