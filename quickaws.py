@@ -178,6 +178,7 @@ class QuickAws(object):
 
 			if not usercommand:
 				# Usercommand was not given, create it automatically
+				# At some point '--save-on-error' flag should be added. See https://github.com/jupyter/nbconvert/issues/626
 				result_files.append(console_output_filename)
 				usercommand = '''
 				jupyter nbconvert --ExecutePreprocessor.timeout={terminate_after_seconds} --to notebook --execute {jupyterfile} --output {jupyterfile}.result.ipynb >>{console_output_filename} 2>&1
@@ -244,24 +245,24 @@ class QuickAws(object):
 			self.bucket_location = self.instance_location
 
 		if not self.bucket_name:
-			self.bucket_name = self._generateUuidName()
+			self.bucket_name = self._generate_uuid_name()
 
 		if not self.keyname:
-			self.keyname = self._generateUuidName()
+			self.keyname = self._generate_uuid_name()
 		
 		if not self.iam_role_name:
-			self.iam_role_name = self._generateUuidName()
+			self.iam_role_name = self._generate_uuid_name()
 
 		if not self.iam_policy_name:
-			self.iam_policy_name = self._generateUuidName()
+			self.iam_policy_name = self._generate_uuid_name()
 		
 		if not self.iam_instance_profile_name:
-			self.iam_instance_profile_name = self._generateUuidName()
+			self.iam_instance_profile_name = self._generate_uuid_name()
 
-	def _generateUuidName(self):
-		return self._getMainTag() + uuid.uuid4().hex
+	def _generate_uuid_name(self):
+		return self._get_main_tag() + uuid.uuid4().hex
 
-	def _getMainTag(self):
+	def _get_main_tag(self):
 		if isinstance(self.tags, str):
 			return self.tags
 		elif not self.tags:
@@ -269,7 +270,7 @@ class QuickAws(object):
 		else:
 			return self.tags[0]
 
-	def _tarFiles(self):
+	def _tar_files(self):
 		# Tar data
 
 		tar = tarfile.open(self.tarname, "w:gz")
@@ -280,7 +281,7 @@ class QuickAws(object):
 				raise FileNotFoundError('File not found for tarring',f)
 		tar.close()
 
-	def _uploadToS3(self):
+	def _upload_to_s3(self):
 		# Upload data to aws
 
 		s3 = boto3.client('s3',region_name=self.bucket_location)
@@ -299,7 +300,7 @@ class QuickAws(object):
 
 		s3.upload_file(self.tarname, self.bucket_name, self.tarname)
 
-	def _createKeys(self):
+	def _create_keys(self):
 		# Create aws instance keys
 		ec2 = boto3.client('ec2', region_name=self.instance_location)
 
@@ -345,7 +346,7 @@ class QuickAws(object):
 					raise e
 			
 
-	def _anacondaInstallString(self):
+	def _anaconda_install_string(self):
 		anaconda_install_string = ''
 		if self.install_anaconda:
 			anaconda_install_string = '''
@@ -354,7 +355,7 @@ class QuickAws(object):
 				'''.format(installed_anaconda_version=self.installed_anaconda_version,cfname=self.console_output_filename)
 		return anaconda_install_string
 
-	def _anacondaUpdateString(self):
+	def _anaconda_update_string(self):
 		anaconda_update_string = ''
 		if self.update_anaconda:
 			anaconda_update_string = '''
@@ -363,16 +364,16 @@ class QuickAws(object):
 				'''.format(cfname=self.console_output_filename)
 		return anaconda_update_string
 
-	def _shutdownString(self):
+	def _shutdown_string(self):
 		shutdown_string = 'sudo shutdown -h now'
 		if self.do_not_shutdown:
 			shutdown_string = ''
 		return shutdown_string
 
-	def _userDataString(self):
-		anaconda_install_string = self._anacondaInstallString()
-		anaconda_update_string = self._anacondaUpdateString()
-		shutdown_string = self._shutdownString()
+	def _user_data_string(self):
+		anaconda_install_string = self._anaconda_install_string()
+		anaconda_update_string = self._anaconda_update_string()
+		shutdown_string = self._shutdown_string()
 
 		user_data = '''#!/bin/bash
 		cd /root # set working directory
@@ -399,14 +400,14 @@ class QuickAws(object):
 									cfname=self.console_output_filename)
 		return user_data
 
-	def _createSpotInstance(self):
-		user_data = self._userDataString()
+	def _create_spot_instance(self):
+		user_data = self._user_data_string()
 
 		ec2 = boto3.client('ec2', region_name=self.instance_location)
 		spot_reqs = ec2.request_spot_instances(
 			SpotPrice=str(self.max_hourly_price),
 			LaunchSpecification={
-				'ImageId':self._searchAmi(),
+				'ImageId':self._search_ami(),
 				'InstanceType':self.instancetype,
 				'Placement':{'AvailabilityZone':self.instance_zone},
 				'KeyName':self.keyname,
@@ -419,7 +420,7 @@ class QuickAws(object):
 
 		print('Created spot request {id}'.format(id=self.spot_request_id))
 
-	def _waitForSpotInstance(self):
+	def _wait_for_spot_instance(self):
 		print('Waiting for spot instance request to be fulfilled', end='')
 		ec2 = boto3.client('ec2', region_name=self.instance_location)
 		spot_wait_sleep = 1
@@ -441,14 +442,14 @@ class QuickAws(object):
 		self.instance.create_tags(Tags=[{'Key':'quickaws','Value':'1'}])
 		print('Spot instance fulfilled with instance {id}'.format(id=self.instance.id))
 
-	def _createInstance(self):
+	def _create_instance(self):
 		# Create actual instance
-		user_data = self._userDataString()
+		user_data = self._user_data_string()
 
 		ec2 = boto3.resource('ec2', region_name=self.instance_location)
 
 		instances = ec2.create_instances(
-			ImageId=self._searchAmi(),
+			ImageId=self._search_ami(),
 			MinCount=1,
 			MaxCount=1,
 			KeyName=self.keyname,
@@ -463,7 +464,7 @@ class QuickAws(object):
 		self.instance = instances[0]
 		print("Created instance {0}".format(self.instance.id))
 
-	def _createInstancePermissions(self):
+	def _create_instance_permissions(self):
 		iam = boto3.resource('iam')
 		instance_profile = iam.InstanceProfile(self.iam_instance_profile_name)
 		try:
@@ -538,7 +539,7 @@ class QuickAws(object):
 				self.delete_iam_instance_profile = True
 		
 
-	def _associateInstanceProfile(self):
+	def _associate_instance_profile(self):
 		# Wait until instance is running
 		print('Waiting for instance to enter ''running'' state')
 		self.instance.wait_until_running()
@@ -556,7 +557,7 @@ class QuickAws(object):
 			InstanceId=self.instance.id)
 		print('Associated instance profile {0} with ec2 instance {1}'.format(self.iam_instance_profile_name, self.instance.id))
 
-	def _printLog(self, chars_printed):
+	def _print_log(self, chars_printed):
 		ec2 = boto3.client('ec2')
 		try:
 			log = self.instance.console_output()
@@ -574,22 +575,22 @@ class QuickAws(object):
 			chars_printed = len(logstr)
 		return chars_printed
 
-	def _waitUntilTerminated(self):
+	def _wait_until_terminated(self):
 		# Wait until instance is terminated
 		print('Waiting for instance to terminate')
 		chars_printed = 0
 		while self.instance.state['Name'] != 'terminated':
-			chars_printed = self._printLog(chars_printed)
+			chars_printed = self._print_log(chars_printed)
 
 		self.instance.wait_until_terminated()
 		self.instance_terminate_time = datetime.datetime.now(pytz.utc)
 
 		# Print rest of the log
-		self._printLog(chars_printed)
+		self._print_log(chars_printed)
 
 		print('Instance terminated')
 
-	def _downloadFromS3(self):
+	def _download_from_s3(self):
 		# Download results from aws
 
 		print('Downloading results from S3')
@@ -610,7 +611,7 @@ class QuickAws(object):
 		tar.extractall()
 		tar.close()
 
-	def _searchAmi(self):
+	def _search_ami(self):
 		if self.instance_image_id:
 			return self.instance_image_id
 		if self.image_description or self.image_name:
@@ -635,10 +636,10 @@ class QuickAws(object):
 			print('Found ami {id} with description: {desc}'.format(id=latest.image_id,desc=latest.description))
 			return latest.image_id
 
-	def _recordInstanceStartTime(self):
+	def _record_instance_start_time(self):
 		self.instance_start_time = self.instance.launch_time
 
-	def _estimatePrice(self):
+	def _estimate_price(self):
 		time_running = (self.instance_terminate_time - self.instance_start_time).total_seconds()
 		total_time = (self.finish_time - self.start_time).total_seconds()
 		total_price_time = max(total_time,60) #Minimum instance billing is for 60 seconds
@@ -647,7 +648,7 @@ class QuickAws(object):
 		print('Running of instance for {seconds:0.0f}s cost approximately {cost:0.5f}USD'.format(seconds=time_running,cost=cost_usd))
 		print('Total run time including setup {seconds:0.0f}'.format(seconds=total_time))
 
-	def _removeRoleFromInstanceProfile(self):
+	def _remove_role_from_instance_profile(self):
 		print('Removing role {role} from instance profile {profile}'.format(role=self.iam_role_name, profile=self.iam_instance_profile_name))
 		iam_client = boto3.client('iam')
 		iam_client.remove_role_from_instance_profile(
@@ -659,7 +660,7 @@ class QuickAws(object):
 		iam_client = boto3.client('iam')
 		role_removed = False
 		if self.delete_iam_instance_profile:
-			self._removeRoleFromInstanceProfile()
+			self._remove_role_from_instance_profile()
 			role_removed = True
 
 			print('Deleting iam instance profile {profile}'.format(profile=self.iam_instance_profile_name))
@@ -680,7 +681,7 @@ class QuickAws(object):
 				)
 		if self.delete_iam_role:
 			if not role_removed:
-				self._removeRoleFromInstanceProfile()
+				self._remove_role_from_instance_profile()
 
 			print('Deleting iam role {role}'.format(role=self.iam_role_name))
 
@@ -706,7 +707,7 @@ class QuickAws(object):
 			ec2_client = boto3.client('ec2', region_name=self.instance_location)
 			ec2_client.delete_key_pair(KeyName=self.keyname)
 		
-	def _logPublicIp(self):
+	def _log_public_ip(self):
 		print('Instance public ip: {ip}'.format(ip=self.instance.public_ip_address))
 		
 
@@ -714,23 +715,23 @@ class QuickAws(object):
 		self.start_time = datetime.datetime.now(pytz.utc)
 
 		if not self.do_not_upload:
-			self._tarFiles()
-			self._uploadToS3()
-		self._createKeys()
+			self._tar_files()
+			self._upload_to_s3()
+		self._create_keys()
 
-		self._createInstancePermissions()
+		self._create_instance_permissions()
 		if self.use_spot_instance:
-			self._createSpotInstance()
-			self._waitForSpotInstance()
+			self._create_spot_instance()
+			self._wait_for_spot_instance()
 		else:
-			self._createInstance()
-		self._recordInstanceStartTime()
-		self._associateInstanceProfile()
-		self._logPublicIp()
-		self._waitUntilTerminated()
+			self._create_instance()
+		self._record_instance_start_time()
+		self._associate_instance_profile()
+		self._log_public_ip()
+		self._wait_until_terminated()
 		self.finish_time = datetime.datetime.now(pytz.utc)
-		self._downloadFromS3()
-		self._estimatePrice()
+		self._download_from_s3()
+		self._estimate_price()
 		if self.perform_cleanup:
 			self._cleanup()
 		print('Finished')
